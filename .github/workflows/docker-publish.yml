@@ -19,7 +19,7 @@ env:
   # Use docker.io for Docker Hub if empty
   REGISTRY: ghcr.io
   # github.repository as <account>/<repo>, must be lowercase for Docker tags
-  IMAGE_NAME: ${{ github.repository | toLowerCase() }}
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
@@ -34,6 +34,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Downcase IMAGE_NAME
+        run: |
+          echo "IMAGE_NAME=${IMAGE_NAME,,}" >> $GITHUB_ENV
 
       # Install the cosign tool except on PR
       - name: Install cosign
