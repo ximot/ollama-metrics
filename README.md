@@ -2,6 +2,8 @@
 
 A lightweight metrics collector and proxy for [Ollama](https://ollama.com/) that exposes Prometheus metrics for monitoring your LLM deployments.
 
+![cover image](.docs/cover.png)
+
 ## Overview
 
 Ollama Metrics Sidecar sits between your applications and Ollama, collecting metrics on:

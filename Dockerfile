@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.24-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
 
@@ -13,7 +13,7 @@ RUN go mod download
 COPY main.go .
 
 # Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main .
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o ollama-metrics .
 
 # Final stage
 FROM scratch
@@ -22,4 +22,4 @@ FROM scratch
 COPY --from=builder /app/main /main
 
 # Command to run
-ENTRYPOINT ["/main"]
+ENTRYPOINT ["/ollama-metrics"]
