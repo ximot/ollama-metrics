@@ -46,6 +46,20 @@ var (
 		},
 		[]string{"endpoint", "model", "status"},
 	)
+	inFlightRequests = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "ollama_inflight_requests",
+			Help: "Number of proxied Ollama requests currently being handled",
+		},
+		[]string{"endpoint", "model"},
+	)
+	queuedRequests = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "ollama_queued_requests",
+			Help: "Number of proxied Ollama requests waiting for a concurrency slot",
+		},
+		[]string{"endpoint", "model"},
+	)
 	requestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name: "ollama_request_duration_seconds",
@@ -139,6 +153,8 @@ func init() {
 		generatedTokens,
 		requestsTotal,
 		requestErrors,
+		inFlightRequests,
+		queuedRequests,
 		requestDuration,
 		timePerToken,
 		promptEvalDuration,
@@ -305,6 +321,43 @@ func updateRequestMetrics(endpoint, modelName string, statusCode int, durationSe
 	requestDuration.WithLabelValues(endpoint, modelName).Observe(durationSec)
 }
 
+func concurrencyLimiterFromEnv() chan struct{} {
+	rawLimit := os.Getenv("MAX_CONCURRENT_REQUESTS")
+	if rawLimit == "" {
+		return nil
+	}
+
+	limit, err := strconv.Atoi(rawLimit)
+	if err != nil || limit <= 0 {
+		log.Printf("Ignoring invalid MAX_CONCURRENT_REQUESTS value %q", rawLimit)
+		return nil
+	}
+
+	log.Printf("Limiting proxied Ollama concurrency to %d requests", limit)
+	return make(chan struct{}, limit)
+}
+
+func acquireRequestSlot(r *http.Request, limiter chan struct{}, endpoint, modelName string) bool {
+	if limiter == nil {
+		return true
+	}
+
+	select {
+	case limiter <- struct{}{}:
+		return true
+	default:
+		queuedRequests.WithLabelValues(endpoint, modelName).Inc()
+		defer queuedRequests.WithLabelValues(endpoint, modelName).Dec()
+	}
+
+	select {
+	case limiter <- struct{}{}:
+		return true
+	case <-r.Context().Done():
+		return false
+	}
+}
+
 func main() {
 	// Configure upstream Ollama host and local port from environment
 	upstreamAddr := os.Getenv("OLLAMA_HOST")
@@ -315,6 +368,7 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
+	requestLimiter := concurrencyLimiterFromEnv()
 
 	log.Printf("Starting Ollama proxy sidecar, forwarding to %s", upstreamAddr)
 
@@ -401,6 +455,23 @@ func main() {
 		// Without this, Ollama's streaming responses omit the usage field.
 		bodyBytes = injectOpenAIStreamUsageOptions(r.URL.Path, bodyBytes)
 		requestModelName := extractRequestModel(bodyBytes)
+		endpoint := endpointLabel(r.URL.Path)
+		metricRequestModelName := metricsModelLabel(requestModelName)
+
+		if !acquireRequestSlot(r, requestLimiter, endpoint, metricRequestModelName) {
+			statusCode := http.StatusServiceUnavailable
+			http.Error(w, "Request cancelled while waiting for concurrency slot", statusCode)
+			updateRequestMetrics(endpoint, metricRequestModelName, statusCode, time.Since(start).Seconds())
+			log.Printf("%s %s -> status=%d duration=%.2fs", r.Method, r.URL.Path, statusCode, time.Since(start).Seconds())
+			return
+		}
+		if requestLimiter != nil {
+			defer func() {
+				<-requestLimiter
+			}()
+		}
+		inFlightRequests.WithLabelValues(endpoint, metricRequestModelName).Inc()
+		defer inFlightRequests.WithLabelValues(endpoint, metricRequestModelName).Dec()
 
 		// Build upstream request
 		targetURL := upstreamAddr + r.URL.Path
@@ -410,7 +481,7 @@ func main() {
 		reqUp, err := http.NewRequest(r.Method, targetURL, bytes.NewReader(bodyBytes))
 		if err != nil {
 			http.Error(w, "Bad request", http.StatusInternalServerError)
-			updateRequestMetrics(endpointLabel(r.URL.Path), metricsModelLabel(requestModelName), http.StatusInternalServerError, time.Since(start).Seconds())
+			updateRequestMetrics(endpoint, metricRequestModelName, http.StatusInternalServerError, time.Since(start).Seconds())
 			log.Printf("ERROR creating upstream request: %v", err)
 			return
 		}
@@ -430,7 +501,7 @@ func main() {
 		respUp, err := upstreamClient.Do(reqUp)
 		if err != nil {
 			http.Error(w, "Upstream error", http.StatusBadGateway)
-			updateRequestMetrics(endpointLabel(r.URL.Path), metricsModelLabel(requestModelName), http.StatusBadGateway, time.Since(start).Seconds())
+			updateRequestMetrics(endpoint, metricRequestModelName, http.StatusBadGateway, time.Since(start).Seconds())
 			log.Printf("ERROR forwarding to upstream: %v", err)
 			return
 		}
@@ -634,7 +705,7 @@ func main() {
 				log.Printf("ERROR parsing /api/ps response: %v", err)
 			}
 			duration := time.Since(start).Seconds()
-			updateRequestMetrics(endpointLabel(r.URL.Path), "unknown", respUp.StatusCode, duration)
+			updateRequestMetrics(endpoint, metricRequestModelName, respUp.StatusCode, duration)
 			log.Printf("%s %s -> status=%d duration=%.2fs", r.Method, r.URL.Path, respUp.StatusCode, duration)
 			// We can return here since request is fully handled
 			return
@@ -647,7 +718,6 @@ func main() {
 		// Update Prometheus metrics if applicable
 		metricModelName := metricsModelLabel(modelName)
 		durationSec := time.Since(start).Seconds()
-		endpoint := endpointLabel(r.URL.Path)
 		updateRequestMetrics(endpoint, metricModelName, respUp.StatusCode, durationSec)
 
 		if modelName != "" {
