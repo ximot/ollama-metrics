@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +32,20 @@ var (
 		},
 		[]string{"model"},
 	)
+	requestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ollama_requests_total",
+			Help: "Total number of proxied Ollama requests",
+		},
+		[]string{"endpoint", "model", "status"},
+	)
+	requestErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ollama_request_errors_total",
+			Help: "Total number of proxied Ollama requests that returned HTTP 4xx or 5xx",
+		},
+		[]string{"endpoint", "model", "status"},
+	)
 	requestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name: "ollama_request_duration_seconds",
@@ -45,6 +60,46 @@ var (
 			Name:    "ollama_time_per_token_seconds",
 			Help:    "Time per generated token (seconds per token)",
 			Buckets: []float64{0.01, 0.05, 0.1, 0.2, 0.5, 1, 2},
+		},
+		[]string{"model"},
+	)
+	promptEvalDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "ollama_prompt_eval_duration_seconds",
+			Help:    "Duration spent evaluating prompt tokens",
+			Buckets: []float64{0.001, 0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60},
+		},
+		[]string{"model"},
+	)
+	evalDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "ollama_eval_duration_seconds",
+			Help:    "Duration spent generating completion tokens",
+			Buckets: []float64{0.001, 0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60},
+		},
+		[]string{"model"},
+	)
+	loadDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "ollama_load_duration_seconds",
+			Help:    "Duration spent loading the model",
+			Buckets: []float64{0.001, 0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60},
+		},
+		[]string{"model"},
+	)
+	totalDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "ollama_total_duration_seconds",
+			Help:    "Total duration reported by Ollama",
+			Buckets: []float64{0.001, 0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300},
+		},
+		[]string{"model"},
+	)
+	generatedTokensPerSecond = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "ollama_generated_tokens_per_second",
+			Help:    "Generated tokens per second based on Ollama eval duration",
+			Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200},
 		},
 		[]string{"model"},
 	)
@@ -68,11 +123,34 @@ var (
 		},
 		[]string{"model"},
 	)
+	modelVRAMUsage = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "ollama_model_vram_mb",
+			Help: "VRAM usage in megabytes for each loaded model",
+		},
+		[]string{"model"},
+	)
 )
 
 func init() {
 	// Register metrics with Prometheus default registry
-	prometheus.MustRegister(promptTokens, generatedTokens, requestDuration, timePerToken, loadedModelsGauge, loadedModelInfo, modelRAMUsage)
+	prometheus.MustRegister(
+		promptTokens,
+		generatedTokens,
+		requestsTotal,
+		requestErrors,
+		requestDuration,
+		timePerToken,
+		promptEvalDuration,
+		evalDuration,
+		loadDuration,
+		totalDuration,
+		generatedTokensPerSecond,
+		loadedModelsGauge,
+		loadedModelInfo,
+		modelRAMUsage,
+		modelVRAMUsage,
+	)
 }
 
 // Structs to parse JSON responses from Ollama
@@ -85,14 +163,28 @@ type generateResponse struct {
 	TotalDuration      *int64      `json:"total_duration,omitempty"`
 	EvalDuration       *int64      `json:"eval_duration,omitempty"`
 	PromptEvalDuration *int64      `json:"prompt_eval_duration,omitempty"`
+	LoadDuration       *int64      `json:"load_duration,omitempty"`
 	DoneReason         interface{} `json:"done_reason,omitempty"`
+}
+
+// OpenAI-compatible API response structs (/v1/chat/completions, /v1/completions)
+type openAIUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+type openAIResponse struct {
+	Model string       `json:"model"`
+	Usage *openAIUsage `json:"usage,omitempty"`
 }
 
 type psResponse struct {
 	Models []struct {
 		Name      string `json:"name"`
 		ID        string `json:"id"`
-		Size      int64  `json:"size"`      // Size in bytes
+		Size      int64  `json:"size"` // Size in bytes
+		SizeVRAM  int64  `json:"size_vram"`
 		Processor string `json:"processor"`
 		Until     string `json:"until"`
 	} `json:"models"`
@@ -139,6 +231,80 @@ func ensureModelTag(modelName string) string {
 	return modelName
 }
 
+func injectOpenAIStreamUsageOptions(path string, bodyBytes []byte) []byte {
+	if !strings.HasPrefix(path, "/v1/") || len(bodyBytes) == 0 {
+		return bodyBytes
+	}
+
+	var reqJson map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &reqJson); err != nil {
+		return bodyBytes
+	}
+
+	if stream, ok := reqJson["stream"].(bool); !ok || !stream {
+		return bodyBytes
+	}
+
+	streamOptions, ok := reqJson["stream_options"].(map[string]interface{})
+	if !ok {
+		streamOptions = make(map[string]interface{})
+	}
+	streamOptions["include_usage"] = true
+	reqJson["stream_options"] = streamOptions
+
+	updatedBody, err := json.Marshal(reqJson)
+	if err != nil {
+		return bodyBytes
+	}
+	return updatedBody
+}
+
+func extractRequestModel(bodyBytes []byte) string {
+	if len(bodyBytes) == 0 {
+		return ""
+	}
+
+	var reqJson map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &reqJson); err != nil {
+		return ""
+	}
+
+	if modelName, ok := reqJson["model"].(string); ok {
+		return ensureModelTag(modelName)
+	}
+	return ""
+}
+
+func endpointLabel(path string) string {
+	endpoint := strings.TrimPrefix(path, "/api/")
+	if endpoint == "" {
+		return path
+	}
+	return endpoint
+}
+
+func metricsModelLabel(modelName string) string {
+	if modelName == "" {
+		return "unknown"
+	}
+	return modelName
+}
+
+func observeNsDuration(metric *prometheus.HistogramVec, modelName string, durationNs int64) {
+	if durationNs > 0 {
+		metric.WithLabelValues(modelName).Observe(float64(durationNs) / 1e9)
+	}
+}
+
+func updateRequestMetrics(endpoint, modelName string, statusCode int, durationSec float64) {
+	status := strconv.Itoa(statusCode)
+	requestsTotal.WithLabelValues(endpoint, modelName, status).Inc()
+	if statusCode >= http.StatusBadRequest {
+		requestErrors.WithLabelValues(endpoint, modelName, status).Inc()
+	}
+	requestDuration.WithLabelValues(endpoint, modelName).Observe(durationSec)
+}
+
 func main() {
 	// Configure upstream Ollama host and local port from environment
 	upstreamAddr := os.Getenv("OLLAMA_HOST")
@@ -160,15 +326,22 @@ func main() {
 		if jsonErr := json.Unmarshal(data, &ps); jsonErr == nil {
 			loadedModelsGauge.Set(float64(len(ps.Models)))
 			loadedModelInfo.Reset()
+			modelRAMUsage.Reset()
+			modelVRAMUsage.Reset()
 			for _, m := range ps.Models {
-				loadedModelInfo.WithLabelValues(ensureModelTag(m.Name)).Set(1)
+				modelName := ensureModelTag(m.Name)
+				loadedModelInfo.WithLabelValues(modelName).Set(1)
+				modelRAMUsage.WithLabelValues(modelName).Set(float64(m.Size) / (1024 * 1024))
+				if m.SizeVRAM > 0 {
+					modelVRAMUsage.WithLabelValues(modelName).Set(float64(m.SizeVRAM) / (1024 * 1024))
+				}
 			}
 		}
 	}
 
 	// Set up HTTP handlers
 	mux := http.NewServeMux()
-	
+
 	// Custom metrics handler that refreshes model data before serving metrics
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		// Refresh model information from /api/ps before serving metrics
@@ -180,15 +353,20 @@ func main() {
 				loadedModelsGauge.Set(float64(len(ps.Models)))
 				loadedModelInfo.Reset()
 				modelRAMUsage.Reset() // Reset RAM usage before updating
-				
+				modelVRAMUsage.Reset()
+
 				// Update model metrics directly from ps response
 				for _, m := range ps.Models {
 					modelName := ensureModelTag(m.Name)
 					loadedModelInfo.WithLabelValues(modelName).Set(1)
-					
+
 					// Convert size from bytes to megabytes
 					ramMB := float64(m.Size) / (1024 * 1024)
 					modelRAMUsage.WithLabelValues(modelName).Set(ramMB)
+					if m.SizeVRAM > 0 {
+						vramMB := float64(m.SizeVRAM) / (1024 * 1024)
+						modelVRAMUsage.WithLabelValues(modelName).Set(vramMB)
+					}
 				}
 				log.Printf("Refreshed metrics data: %d models loaded", len(ps.Models))
 			} else {
@@ -197,11 +375,11 @@ func main() {
 		} else {
 			log.Printf("ERROR refreshing model metrics: %v", err)
 		}
-		
+
 		// Serve metrics using the standard Prometheus handler
 		promhttp.Handler().ServeHTTP(w, r)
 	})
-	
+
 	// All other paths -> proxy handler
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -218,6 +396,12 @@ func main() {
 			r.Body.Close()
 		}
 
+		// For OpenAI-compatible streaming requests, inject stream_options
+		// to ensure the final SSE chunk includes token usage statistics.
+		// Without this, Ollama's streaming responses omit the usage field.
+		bodyBytes = injectOpenAIStreamUsageOptions(r.URL.Path, bodyBytes)
+		requestModelName := extractRequestModel(bodyBytes)
+
 		// Build upstream request
 		targetURL := upstreamAddr + r.URL.Path
 		if r.URL.RawQuery != "" {
@@ -226,6 +410,7 @@ func main() {
 		reqUp, err := http.NewRequest(r.Method, targetURL, bytes.NewReader(bodyBytes))
 		if err != nil {
 			http.Error(w, "Bad request", http.StatusInternalServerError)
+			updateRequestMetrics(endpointLabel(r.URL.Path), metricsModelLabel(requestModelName), http.StatusInternalServerError, time.Since(start).Seconds())
 			log.Printf("ERROR creating upstream request: %v", err)
 			return
 		}
@@ -245,6 +430,7 @@ func main() {
 		respUp, err := upstreamClient.Do(reqUp)
 		if err != nil {
 			http.Error(w, "Upstream error", http.StatusBadGateway)
+			updateRequestMetrics(endpointLabel(r.URL.Path), metricsModelLabel(requestModelName), http.StatusBadGateway, time.Since(start).Seconds())
 			log.Printf("ERROR forwarding to upstream: %v", err)
 			return
 		}
@@ -263,11 +449,76 @@ func main() {
 		w.WriteHeader(respUp.StatusCode)
 
 		// Variables for metrics/logging
-		var modelName string
+		modelName := requestModelName
 		var promptCount, generatedCount int
-		var evalDurationNs int64
+		var promptEvalDurationNs, evalDurationNs, loadDurationNs, totalDurationNs int64
 
-		if r.URL.Path == "/api/generate" || r.URL.Path == "/api/chat" {
+		if strings.HasPrefix(r.URL.Path, "/v1/") {
+			// OpenAI-compatible endpoints (/v1/chat/completions, /v1/completions, /v1/embeddings)
+			contentType := respUp.Header.Get("Content-Type")
+			isStreaming := strings.Contains(contentType, "text/event-stream")
+
+			if isStreaming {
+				// Streaming SSE: forward chunks to client, parse usage from final chunk
+				var buf bytes.Buffer
+				streamWriter := io.MultiWriter(w, &buf)
+				flusher, _ := w.(http.Flusher)
+				chunk := make([]byte, 4096)
+				for {
+					n, readErr := respUp.Body.Read(chunk)
+					if n > 0 {
+						if _, writeErr := streamWriter.Write(chunk[:n]); writeErr != nil {
+							log.Printf("WARNING: client write error: %v", writeErr)
+							break
+						}
+						if flusher != nil {
+							flusher.Flush()
+						}
+					}
+					if readErr != nil {
+						if readErr != io.EOF {
+							log.Printf("ERROR reading upstream: %v", readErr)
+						}
+						break
+					}
+				}
+				// Parse SSE data lines for model and usage
+				for _, line := range bytes.Split(buf.Bytes(), []byte("\n")) {
+					line = bytes.TrimSpace(line)
+					if !bytes.HasPrefix(line, []byte("data: ")) {
+						continue
+					}
+					data := bytes.TrimPrefix(line, []byte("data: "))
+					if bytes.Equal(data, []byte("[DONE]")) {
+						continue
+					}
+					var oaiResp openAIResponse
+					if err := json.Unmarshal(data, &oaiResp); err == nil {
+						if oaiResp.Model != "" {
+							modelName = ensureModelTag(oaiResp.Model)
+						}
+						if oaiResp.Usage != nil {
+							promptCount = oaiResp.Usage.PromptTokens
+							generatedCount = oaiResp.Usage.CompletionTokens
+						}
+					}
+				}
+			} else {
+				// Non-streaming: read full response body
+				bodyData, _ := io.ReadAll(respUp.Body)
+				w.Write(bodyData)
+				var oaiResp openAIResponse
+				if err := json.Unmarshal(bodyData, &oaiResp); err == nil {
+					if oaiResp.Model != "" {
+						modelName = ensureModelTag(oaiResp.Model)
+					}
+					if oaiResp.Usage != nil {
+						promptCount = oaiResp.Usage.PromptTokens
+						generatedCount = oaiResp.Usage.CompletionTokens
+					}
+				}
+			}
+		} else if r.URL.Path == "/api/generate" || r.URL.Path == "/api/chat" {
 			// Handle streaming JSON response for generate/chat
 			var buf bytes.Buffer
 			// MultiWriter to write to client output and buffer simultaneously
@@ -305,7 +556,12 @@ func main() {
 				// This is a models list response, not a typical generate response
 				for _, model := range modelsResp.Models {
 					modelName = ensureModelTag(model.Model)
-					modelRAMUsage.WithLabelValues(modelName).Set(float64(model.SizeVRAM) / (1024 * 1024))
+					if model.Size > 0 {
+						modelRAMUsage.WithLabelValues(modelName).Set(float64(model.Size) / (1024 * 1024))
+					}
+					if model.SizeVRAM > 0 {
+						modelVRAMUsage.WithLabelValues(modelName).Set(float64(model.SizeVRAM) / (1024 * 1024))
+					}
 				}
 				log.Printf("Received models list response with %d models", len(modelsResp.Models))
 				// No token counts for models list response
@@ -334,8 +590,17 @@ func main() {
 						if res.EvalCount != nil {
 							generatedCount = *res.EvalCount
 						}
+						if res.PromptEvalDuration != nil {
+							promptEvalDurationNs = *res.PromptEvalDuration
+						}
 						if res.EvalDuration != nil {
 							evalDurationNs = *res.EvalDuration
+						}
+						if res.LoadDuration != nil {
+							loadDurationNs = *res.LoadDuration
+						}
+						if res.TotalDuration != nil {
+							totalDurationNs = *res.TotalDuration
 						}
 					}
 				}
@@ -349,38 +614,42 @@ func main() {
 				loadedModelsGauge.Set(float64(len(ps.Models)))
 				loadedModelInfo.Reset()
 				modelRAMUsage.Reset() // Reset RAM usage before updating
-				
+				modelVRAMUsage.Reset()
+
 				// Update model metrics directly from ps response
 				for _, m := range ps.Models {
 					modelName := ensureModelTag(m.Name)
 					loadedModelInfo.WithLabelValues(modelName).Set(1)
-					
-						// Convert size from bytes to megabytes
+
+					// Convert size from bytes to megabytes
 					ramMB := float64(m.Size) / (1024 * 1024)
 					modelRAMUsage.WithLabelValues(modelName).Set(ramMB)
+					if m.SizeVRAM > 0 {
+						vramMB := float64(m.SizeVRAM) / (1024 * 1024)
+						modelVRAMUsage.WithLabelValues(modelName).Set(vramMB)
+					}
 					log.Printf("Model %s RAM usage: %.2f MB", modelName, ramMB)
 				}
 			} else {
 				log.Printf("ERROR parsing /api/ps response: %v", err)
 			}
+			duration := time.Since(start).Seconds()
+			updateRequestMetrics(endpointLabel(r.URL.Path), "unknown", respUp.StatusCode, duration)
+			log.Printf("%s %s -> status=%d duration=%.2fs", r.Method, r.URL.Path, respUp.StatusCode, duration)
 			// We can return here since request is fully handled
 			return
 		} else {
 			// Other endpoints (e.g. /api/tags, /api/pull) - just copy through
 			io.Copy(w, respUp.Body)
-			// Try to get model name from request (if JSON body has "model")
-			if len(bodyBytes) > 0 {
-				var reqJson map[string]interface{}
-				if err := json.Unmarshal(bodyBytes, &reqJson); err == nil {
-					if m, ok := reqJson["model"].(string); ok {
-						modelName = ensureModelTag(m)
-					}
-				}
-			}
 			// No token metrics for non-generate endpoints
 		}
 
 		// Update Prometheus metrics if applicable
+		metricModelName := metricsModelLabel(modelName)
+		durationSec := time.Since(start).Seconds()
+		endpoint := endpointLabel(r.URL.Path)
+		updateRequestMetrics(endpoint, metricModelName, respUp.StatusCode, durationSec)
+
 		if modelName != "" {
 			if promptCount > 0 {
 				promptTokens.WithLabelValues(modelName).Add(float64(promptCount))
@@ -388,28 +657,26 @@ func main() {
 			if generatedCount > 0 {
 				generatedTokens.WithLabelValues(modelName).Add(float64(generatedCount))
 			}
-			durationSec := time.Since(start).Seconds()
-			endpoint := strings.TrimPrefix(r.URL.Path, "/api/")
-			if endpoint == "" {
-				endpoint = r.URL.Path
-			}
-			requestDuration.WithLabelValues(endpoint, modelName).Observe(durationSec)
+			observeNsDuration(promptEvalDuration, modelName, promptEvalDurationNs)
+			observeNsDuration(evalDuration, modelName, evalDurationNs)
+			observeNsDuration(loadDuration, modelName, loadDurationNs)
+			observeNsDuration(totalDuration, modelName, totalDurationNs)
 			if generatedCount > 0 && evalDurationNs > 0 {
 				// evalDurationNs is in nanoseconds
 				secondsPerToken := float64(evalDurationNs) / 1e9 / float64(generatedCount)
 				timePerToken.WithLabelValues(modelName).Observe(secondsPerToken)
+				generatedTokensPerSecond.WithLabelValues(modelName).Observe(float64(generatedCount) / (float64(evalDurationNs) / 1e9))
 			}
 			// Removed the redundant /api/ps call for /api/generate and /api/chat endpoints
 			// Model metrics are now refreshed on every /metrics request
 		}
 
 		// Logging
-		duration := time.Since(start).Seconds()
 		if modelName != "" && (promptCount > 0 || generatedCount > 0) {
 			log.Printf("%s %s -> model=%s prompt_tokens=%d generated_tokens=%d duration=%.2fs",
-				r.Method, r.URL.Path, modelName, promptCount, generatedCount, duration)
+				r.Method, r.URL.Path, modelName, promptCount, generatedCount, durationSec)
 		} else {
-			log.Printf("%s %s -> status=%d duration=%.2fs", r.Method, r.URL.Path, respUp.StatusCode, duration)
+			log.Printf("%s %s -> status=%d duration=%.2fs", r.Method, r.URL.Path, respUp.StatusCode, durationSec)
 		}
 	})
 
